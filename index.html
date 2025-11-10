@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Timeboxed To-Do List</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Load Tone.js for the alarm sound -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7fafc;
+        }
+        /* Alarm Animation */
+        .alarming {
+            animation: pulse-red 0.8s infinite alternate;
+            border: 4px solid #ef4444; /* red-500 border on the master clock */
+            background-color: #fee2e2;
+        }
+        @keyframes pulse-red {
+            from { box-shadow: 0 0 0px 0 rgba(239, 68, 68, 0.7); }
+            to { box-shadow: 0 0 20px 8px rgba(239, 68, 68, 0.9); }
+        }
+        .master-time {
+            font-variant-numeric: tabular-nums;
+            min-width: 250px;
+        }
+        .time-control-button {
+            width: 70px; /* Wider for text */
+            height: 40px;
+            font-size: 1rem;
+            line-height: 1;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            border-radius: 0.5rem;
+            transition: all 0.15s;
+        }
+        
+        /* New Celebration Animation */
+        .celebration-pop {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            animation: ta-da 1s ease-out forwards;
+            z-index: 10;
+        }
+        .celebration-pop svg {
+            width: 4rem; /* Adjust SVG size */
+            height: 4rem;
+        }
+        @keyframes ta-da {
+            0% { opacity: 0; transform: translate(-50%, -50%) scale(0.5); }
+            30% { opacity: 1; transform: translate(-50%, -50%) scale(1.5); }
+            100% { opacity: 0; transform: translate(-50%, -50%) scale(2); }
+        }
+    </style>
+</head>
+<body class="min-h-screen p-4 sm:p-8">
+
+    <div id="app-container" class="max-w-4xl mx-auto">
+        <header class="text-center mb-10">
+            <h1 class="text-5xl font-extrabold text-indigo-700 tracking-tight">Timebox Productivity Session</h1>
+            <p class="mt-2 text-gray-600">Set your total time, then tackle your to-do list before the master clock runs out.</p>
+        </header>
+
+        <!-- Loading & Status Indicator -->
+        <div id="status-message" class="text-center p-3 mb-6 bg-green-100 text-green-700 rounded-lg shadow-md" style="display: block;">
+            Application initialized. Data stored locally in your browser.
+        </div>
+
+        <!-- Master Session Display (Always Visible) -->
+        <div id="master-timer-display" class="master-time bg-white p-6 rounded-xl shadow-2xl mb-8 flex flex-col items-center justify-center border-b-8 border-indigo-500">
+            <!-- Content changes based on session state -->
+        </div>
+
+        <!-- Task Input Area (NOW ALWAYS VISIBLE) -->
+        <div id="task-input-area" class="bg-white p-6 rounded-xl shadow-2xl mb-8">
+            <h2 class="text-2xl font-semibold mb-4 text-gray-800">Plan Your Tasks</h2>
+            <form id="task-form" class="flex space-x-3">
+                <input type="text" id="task-description" placeholder="Add a task (e.g., Draft email to client)"
+                       class="flex-grow p-3 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500 text-lg" required>
+                <button type="submit" id="add-task-button" 
+                        class="bg-indigo-600 text-white p-3 rounded-lg font-bold hover:bg-indigo-700 transition duration-150 shadow-lg flex-shrink-0">
+                    Add
+                </button>
+            </form>
+            <p id="task-input-tip" class="mt-2 text-sm text-center text-gray-500">
+                You can add tasks anytime. Start the timebox above to enable completing them.
+            </p>
+        </div>
+
+        <!-- Task List Area (NOW ALWAYS VISIBLE) -->
+        <div class="space-y-4">
+            <h2 class="text-3xl font-bold text-gray-800 mb-4">Master To-Do List</h2>
+            <div id="task-list" class="space-y-4">
+                <!-- Tasks will be rendered here -->
+            </div>
+            <p id="empty-state" class="text-center text-gray-500 p-8 rounded-xl bg-white shadow-inner" style="display: none;">
+                Add your goals for this timebox session above!
+            </p>
+        </div>
+
+    </div>
+
+    <!-- Application Script -->
+    <script type="module">
+        // --- Local Storage Configuration ---
+        const STORAGE_KEYS = {
+            SESSION: 'timebox_session',
+            TASKS: 'timebox_tasks'
+        };
+
+        // New global state for time setup before starting the session
+        let setupTime = {
+            hours: 0,
+            minutes: 25,
+            seconds: 0
+        };
+
+        let masterIntervalId = null;
+        let masterSessionState = { isActive: false, masterTargetTimestamp: 0, isAlarming: false };
+
+        // DOM Elements
+        const statusMessage = document.getElementById('status-message');
+        const masterTimerDisplay = document.getElementById('master-timer-display');
+        const taskList = document.getElementById('task-list');
+        const emptyState = document.getElementById('empty-state');
+        const taskForm = document.getElementById('task-form');
+
+        // --- Tone.js Alarm Setup ---
+        const synth = new Tone.Synth({
+            oscillator: { type: "sine" },
+            envelope: {
+                attack: 0.1,
+                decay: 0.2,
+                sustain: 0.3,
+                release: 1.0
+            }
+        }).toDestination();
+
+        let isAlarmPlaying = false;
+
+        function playAlarm() {
+            if (!isAlarmPlaying) {
+                isAlarmPlaying = true;
+                Tone.Transport.scheduleRepeat((time) => {
+                    synth.triggerAttackRelease("A4", "4n", time);
+                }, "1", Tone.now());
+                Tone.Transport.start();
+            }
+        }
+
+        function stopAlarm() {
+            if (isAlarmPlaying) {
+                Tone.Transport.stop();
+                Tone.Transport.cancel();
+                isAlarmPlaying = false;
+            }
+        }
+
+        // --- Utility Functions ---
+
+        function formatTimeRemaining(ms) {
+            if (ms <= 0) return '00:00:00';
+
+            const totalSeconds = Math.floor(ms / 1000);
+            const hours = String(Math.floor(totalSeconds / 3600)).padStart(2, '0');
+            const minutes = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
+            const seconds = String(totalSeconds % 60).padStart(2, '0');
+
+            return `${hours}:${minutes}:${seconds}`;
+        }
+        
+        function generateId() {
+            return crypto.randomUUID();
+        }
+
+        // --- Local Storage Management ---
+        
+        function loadTasks() {
+            const tasksJson = localStorage.getItem(STORAGE_KEYS.TASKS);
+            return tasksJson ? JSON.parse(tasksJson) : [];
+        }
+
+        function saveTasks(tasks) {
+            localStorage.setItem(STORAGE_KEYS.TASKS, JSON.stringify(tasks));
+            renderTasks(tasks); // Update UI immediately
+        }
+
+        function loadSessionState() {
+            const stateJson = localStorage.getItem(STORAGE_KEYS.SESSION);
+            const storedState = stateJson ? JSON.parse(stateJson) : {};
+            return {
+                isActive: storedState.isActive || false,
+                masterTargetTimestamp: storedState.masterTargetTimestamp || 0,
+                isAlarming: storedState.isAlarming || false,
+            };
+        }
+
+        function saveSessionState(state) {
+            masterSessionState = state;
+            localStorage.setItem(STORAGE_KEYS.SESSION, JSON.stringify(state));
+            renderMasterSessionDisplay(); // Update UI
+        }
+
+
+        // --- Time Control Functions (Inactive State) ---
+        
+        function updateSetupTimeDisplay() {
+            const hEl = document.getElementById('setup-hours-display');
+            const mEl = document.getElementById('setup-minutes-display');
+            const sEl = document.getElementById('setup-seconds-display');
+
+            if (hEl) hEl.textContent = String(setupTime.hours).padStart(2, '0');
+            if (mEl) mEl.textContent = String(setupTime.minutes).padStart(2, '0');
+            if (sEl) sEl.textContent = String(setupTime.seconds).padStart(2, '0');
+        }
+
+        function adjustTime(unit, amount) {
+            // Only runs if session is inactive
+            if (masterSessionState.isActive) return;
+
+            let value = setupTime[unit] + amount;
+
+            if (unit === 'hours') {
+                setupTime.hours = Math.max(0, value);
+            } else if (unit === 'minutes') {
+                if (value >= 60) {
+                    setupTime.hours += Math.floor(value / 60);
+                    value %= 60;
+                } else if (value < 0) {
+                    if (setupTime.hours > 0) {
+                        setupTime.hours -= 1;
+                        value += 60;
+                    } else {
+                        value = 0; // Cannot go negative past 0 hours
+                    }
+                }
+                setupTime.minutes = Math.max(0, value);
+
+            } else if (unit === 'seconds') {
+                if (value >= 60) {
+                    setupTime.minutes += Math.floor(value / 60);
+                    value %= 60;
+                    // Handle minute overflow into hours
+                    if (setupTime.minutes >= 60) {
+                        setupTime.hours += Math.floor(setupTime.minutes / 60);
+                        setupTime.minutes %= 60;
+                    }
+                } else if (value < 0) {
+                    if (setupTime.minutes > 0 || setupTime.hours > 0) {
+                        setupTime.minutes -= 1;
+                        value += 60;
+                        // Handle minute underflow from hours
+                        if (setupTime.minutes < 0) {
+                            if (setupTime.hours > 0) {
+                                setupTime.hours -= 1;
+                                setupTime.minutes += 60;
+                            } else {
+                                setupTime.minutes = 0;
+                                value = 0;
+                            }
+                        }
+                    } else {
+                        value = 0; // Cannot go negative past 0 hours/minutes
+                    }
+                }
+                setupTime.seconds = Math.max(0, value);
+            }
+            // Ensure no negative values after final adjustments
+            setupTime.hours = Math.max(0, setupTime.hours);
+            setupTime.minutes = Math.max(0, setupTime.minutes);
+            setupTime.seconds = Math.max(0, setupTime.seconds);
+
+            // Re-render the setup display
+            updateSetupTimeDisplay();
+        }
+
+        // --- Time Control Functions (Active State) ---
+        
+        function adjustActiveTime(minutesAmount) {
+            if (!masterSessionState.isActive || masterSessionState.isAlarming) return;
+
+            const adjustmentMs = minutesAmount * 60 * 1000;
+            let newTargetTimestamp = masterSessionState.masterTargetTimestamp + adjustmentMs;
+
+            // Prevent target time from being less than 1 second in the future
+            const now = Date.now();
+            if (newTargetTimestamp < now + 1000) {
+                newTargetTimestamp = now + 1000; 
+            }
+
+            const newState = { 
+                ...masterSessionState, 
+                masterTargetTimestamp: newTargetTimestamp 
+            };
+            saveSessionState(newState); 
+        }
+        
+        // --- Master Timer Logic ---
+
+        function startSession() {
+            // Read from global setupTime state
+            const hours = setupTime.hours;
+            const minutes = setupTime.minutes;
+            const seconds = setupTime.seconds;
+
+            const durationMs = (hours * 3600 + minutes * 60 + seconds) * 1000;
+            
+            if (durationMs <= 0) {
+                console.error('Please set a duration greater than zero.');
+                return;
+            }
+            
+            const targetTimestamp = Date.now() + durationMs;
+
+            const newState = {
+                isActive: true,
+                masterTargetTimestamp: targetTimestamp,
+                isAlarming: false,
+            };
+            saveSessionState(newState);
+            startMasterTimer();
+            // Re-render tasks to enable completion buttons
+            renderTasks(loadTasks()); 
+        }
+
+        function stopSession() {
+            // Clear the local interval on stop
+            if (masterIntervalId) {
+                clearInterval(masterIntervalId);
+                masterIntervalId = null;
+            }
+
+            const newState = {
+                isActive: false,
+                masterTargetTimestamp: 0,
+                isAlarming: false,
+            };
+            saveSessionState(newState);
+            // Re-render tasks to disable completion buttons
+            renderTasks(loadTasks()); 
+        }
+
+        function dismissMasterAlarm() {
+            const newState = { ...masterSessionState, isAlarming: false };
+            saveSessionState(newState);
+            stopAlarm();
+            // Since the session is over, we don't need the timer loop anymore unless we restart it
+            if (masterIntervalId) {
+                clearInterval(masterIntervalId);
+                masterIntervalId = null;
+            }
+        }
+
+        function startMasterTimer() {
+            if (masterIntervalId) {
+                clearInterval(masterIntervalId);
+            }
+
+            masterIntervalId = setInterval(() => {
+                const now = Date.now();
+                const remaining = masterSessionState.masterTargetTimestamp - now;
+                const timeEl = document.getElementById('master-countdown-time');
+                let sessionStateChanged = false;
+
+                if (remaining <= 0) {
+                    if (masterSessionState.isActive && !masterSessionState.isAlarming) {
+                        // Trigger alarm state in Local Storage
+                        const newState = { ...masterSessionState, isAlarming: true };
+                        saveSessionState(newState); // This will call renderMasterSessionDisplay
+                        sessionStateChanged = true;
+                    }
+                    if (sessionStateChanged) return; // Exit if state changed and redraw occurred
+                }
+
+                // Local UI update
+                if (timeEl) {
+                    timeEl.textContent = formatTimeRemaining(remaining);
+                }
+
+                if (remaining <= 0 && masterSessionState.isActive && !masterSessionState.isAlarming) {
+                     // If the state was not updated above (e.g., race condition), ensure the interval stops
+                     clearInterval(masterIntervalId);
+                     masterIntervalId = null;
+                }
+            }, 1000);
+        }
+        
+        // Function to update the task input UI state
+        function updateTaskInputState() {
+            const isTimerRunning = masterSessionState.isActive && masterSessionState.masterTargetTimestamp > Date.now();
+            const canAddTasks = !masterSessionState.isAlarming;
+
+            const button = document.getElementById('add-task-button');
+            const input = document.getElementById('task-description');
+            const tip = document.getElementById('task-input-tip');
+
+            if (button && input && tip) {
+                if (canAddTasks) {
+                    button.disabled = false;
+                    button.className = 'bg-indigo-600 text-white p-3 rounded-lg font-bold hover:bg-indigo-700 transition duration-150 shadow-lg flex-shrink-0';
+                    input.placeholder = 'Add a task (e.g., Draft email to client)';
+                    
+                    tip.textContent = isTimerRunning
+                        ? 'Completing tasks is enabled during the active session.'
+                        : 'You can add tasks anytime. Start the timebox above to enable completing them.';
+                    tip.style.display = 'block';
+
+                } else {
+                    button.disabled = true;
+                    button.className = 'bg-gray-400 text-white p-3 rounded-lg font-bold transition duration-150 flex-shrink-0 cursor-not-allowed';
+                    input.placeholder = 'Session ended. Dismiss alarm or reset timer to add tasks.';
+                    tip.textContent = 'Session ended. Dismiss alarm or reset timer to add tasks.';
+                    tip.style.display = 'block';
+                }
+            }
+        }
+
+        function renderMasterSessionDisplay() {
+            const state = masterSessionState;
+            const remainingMs = state.masterTargetTimestamp - Date.now();
+            const timeRemainingText = formatTimeRemaining(remainingMs);
+            
+            updateTaskInputState();
+
+            masterTimerDisplay.className = `master-time bg-white p-6 rounded-xl shadow-2xl mb-8 flex flex-col items-center justify-center border-b-8 ${
+                state.isActive && state.isAlarming ? 'alarming border-red-500' : 
+                state.isActive ? 'border-indigo-500' : 
+                'border-gray-300'
+            }`;
+
+            if (state.isActive) {
+                // Session is running or alarming
+                
+                if (state.isAlarming) {
+                    playAlarm();
+                    masterTimerDisplay.innerHTML = `
+                        <p class="text-xl font-bold text-red-700 mb-2">TIMEBOX ENDED!</p>
+                        <span class="text-6xl sm:text-7xl font-extrabold text-red-700 mb-4">${timeRemainingText}</span>
+                        <div class="flex space-x-4">
+                            <button onclick="window.dismissMasterAlarm()" class="bg-yellow-500 text-white p-3 rounded-lg font-semibold hover:bg-yellow-600 transition shadow-md">
+                                Stop Alarm
+                            </button>
+                            <button onclick="window.stopSession()" class="bg-gray-500 text-white p-3 rounded-lg font-semibold hover:bg-gray-600 transition shadow-md">
+                                Reset Session
+                            </button>
+                        </div>
+                    `;
+                } else if (remainingMs > 0) {
+                    stopAlarm();
+                    masterTimerDisplay.innerHTML = `
+                        <p class="text-xl font-bold text-gray-700 mb-2">TIME REMAINING</p>
+                        <span id="master-countdown-time" class="text-6xl sm:text-8xl font-extrabold text-indigo-700 mb-4">${timeRemainingText}</span>
+                        
+                        <!-- Active Time Adjustment Controls -->
+                        <div class="flex space-x-6 justify-center mt-4 mb-4">
+                            <!-- -1 minute -->
+                            <button onclick="window.adjustActiveTime(-1)" 
+                                    class="time-control-button bg-red-500 text-white hover:bg-red-600 shadow-md">
+                                -1 min
+                            </button>
+                            <!-- Stop Button -->
+                            <button onclick="window.stopSession()" class="bg-red-500 text-white p-2 px-4 rounded-lg font-semibold hover:bg-red-600 transition shadow-md">
+                                Stop
+                            </button>
+                            <!-- +5 minutes -->
+                            <button onclick="window.adjustActiveTime(5)" 
+                                    class="time-control-button bg-green-500 text-white hover:bg-green-600 shadow-md">
+                                +5 min
+                            </button>
+                        </div>
+                    `;
+                    // Ensure timer starts/restarts when loaded
+                    startMasterTimer();
+                } else {
+                    // Timer has run out but hasn't triggered alarming state (or alarm dismissed)
+                    stopAlarm();
+                    masterTimerDisplay.innerHTML = `
+                        <p class="text-xl font-bold text-red-500 mb-2">SESSION EXPIRED</p>
+                        <span class="text-6xl sm:text-7xl font-extrabold text-red-500 mb-4">${timeRemainingText}</span>
+                        <button onclick="window.stopSession()" class="bg-gray-500 text-white p-3 rounded-lg font-semibold hover:bg-gray-600 transition shadow-md">
+                            Reset Session
+                        </button>
+                    `;
+                }
+
+            } else {
+                // Session is inactive - show setup form with buttons
+                stopAlarm();
+                
+                masterTimerDisplay.innerHTML = `
+                    <h2 class="text-3xl font-bold mb-4 text-indigo-700">Set Session Duration</h2>
+                    <form id="session-setup-form" class="space-y-4 w-full max-w-lg">
+                        <div class="grid grid-cols-3 gap-6">
+                            
+                            <!-- Hours Control -->
+                            <div class="flex flex-col items-center space-y-2">
+                                <button type="button" onclick="window.adjustTime('hours', 1)" class="time-control-button bg-indigo-500 text-white hover:bg-indigo-600 shadow-md">+</button>
+                                <div id="setup-hours-display" class="p-3 w-full border border-gray-300 rounded-lg text-center text-3xl font-mono font-bold">00</div>
+                                <label for="setup-hours" class="text-xs font-semibold text-gray-500 uppercase">Hours</label>
+                                <button type="button" onclick="window.adjustTime('hours', -1)" class="time-control-button bg-red-500 text-white hover:bg-red-600 shadow-md">–</button>
+                            </div>
+                            
+                            <!-- Minutes Control -->
+                            <div class="flex flex-col items-center space-y-2">
+                                <button type="button" onclick="window.adjustTime('minutes', 5)" class="time-control-button bg-indigo-500 text-white hover:bg-indigo-600 shadow-md">+</button>
+                                <div id="setup-minutes-display" class="p-3 w-full border border-gray-300 rounded-lg text-center text-3xl font-mono font-bold">25</div>
+                                <label for="setup-minutes" class="text-xs font-semibold text-gray-500 uppercase">Minutes</label>
+                                <button type="button" onclick="window.adjustTime('minutes', -5)" class="time-control-button bg-red-500 text-white hover:bg-red-600 shadow-md">–</button>
+                            </div>
+                            
+                            <!-- Seconds Control -->
+                            <div class="flex flex-col items-center space-y-2">
+                                <button type="button" onclick="window.adjustTime('seconds', 5)" class="time-control-button bg-indigo-500 text-white hover:bg-indigo-600 shadow-md">+</button>
+                                <div id="setup-seconds-display" class="p-3 w-full border border-gray-300 rounded-lg text-center text-3xl font-mono font-bold">00</div>
+                                <label for="setup-seconds" class="text-xs font-semibold text-gray-500 uppercase">Seconds</label>
+                                <button type="button" onclick="window.adjustTime('seconds', -5)" class="time-control-button bg-red-500 text-white hover:bg-red-600 shadow-md">–</button>
+                            </div>
+                        </div>
+                        <button type="submit" class="w-full bg-indigo-600 text-white p-3 rounded-lg font-bold hover:bg-indigo-700 transition duration-150 shadow-lg mt-4">
+                            Start Timeboxed Session
+                        </button>
+                    </form>
+                `;
+
+                // Initialize the display with setupTime state
+                updateSetupTimeDisplay();
+
+                // Re-attach event listener for the dynamic form
+                document.getElementById('session-setup-form')?.addEventListener('submit', (e) => {
+                    e.preventDefault();
+                    // startSession now reads from the global setupTime state
+                    startSession();
+                });
+            }
+        }
+
+
+        // --- Task Functions (Local Storage CRUD) ---
+
+        function addTask(description) {
+            // Allows adding tasks regardless of session state
+            
+            const tasks = loadTasks();
+            const newTask = {
+                id: generateId(),
+                description: description,
+                isComplete: false,
+                createdAt: Date.now()
+            };
+            tasks.push(newTask);
+            saveTasks(tasks);
+        }
+
+        function toggleTaskComplete(taskId, isCurrentlyComplete) {
+            // Only allow toggling if the session is currently active.
+            if (!masterSessionState.isActive) return;
+
+            const tasks = loadTasks();
+            const taskIndex = tasks.findIndex(t => t.id === taskId);
+            
+            if (taskIndex !== -1) {
+                if (!isCurrentlyComplete) {
+                    // Task is being marked COMPLETE - trigger celebration!
+                    const taskElement = document.getElementById(`task-${taskId}`);
+                    if (taskElement) {
+                        const celebrationDiv = document.createElement('div');
+                        celebrationDiv.className = 'celebration-pop';
+                        
+                        // Using inline SVG for guaranteed cross-browser "Ta-Da" effect
+                        celebrationDiv.innerHTML = `
+                            <svg class="w-16 h-16 text-yellow-400 drop-shadow-lg" fill="currentColor" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M9.049 2.927c.3-.921 1.603-.921 1.902 0l1.173 3.616a1 1 0 00.959.695h3.807c.969 0 1.371 1.24.588 1.839l-3.082 2.242a1 1 0 00-.364 1.118l1.173 3.616c.3.921-.755 1.688-1.538 1.118l-3.082-2.242a1 1 0 00-1.176 0l-3.082 2.242c-.783.57-1.838-.197-1.538-1.118l1.173-3.616a1 1 0 00-.364-1.118L2.094 9.077c-.783-.599-.381-1.839.588-1.839h3.807a1 1 0 00.959-.695l1.173-3.616z"></path>
+                            </svg>
+                        `;
+                        
+                        // Add the temporary animation element
+                        taskElement.appendChild(celebrationDiv);
+                        
+                        // Remove the element after the animation finishes (1 second)
+                        setTimeout(() => {
+                            if (taskElement.contains(celebrationDiv)) {
+                                taskElement.removeChild(celebrationDiv);
+                            }
+                        }, 1000); 
+                    }
+                }
+
+                tasks[taskIndex].isComplete = !isCurrentlyComplete;
+                saveTasks(tasks);
+            }
+        }
+
+        function deleteTask(taskId) {
+            let tasks = loadTasks();
+            tasks = tasks.filter(t => t.id !== taskId);
+            saveTasks(tasks);
+        }
+
+        function renderTasks(tasksArray) {
+            taskList.innerHTML = '';
+            // Sort incomplete tasks first, then complete tasks
+            tasksArray.sort((a, b) => (a.isComplete === b.isComplete ? 0 : a.isComplete ? 1 : -1));
+
+            if (tasksArray.length === 0) {
+                emptyState.style.display = 'block';
+                return;
+            }
+            emptyState.style.display = 'none';
+
+            tasksArray.forEach(task => {
+                const isComplete = task.isComplete;
+                // Disable toggle button if session is inactive
+                const isDisabled = !masterSessionState.isActive;
+                const toggleHandler = isDisabled ? '' : `onclick="window.toggleTaskComplete('${task.id}', ${isComplete})"`;
+
+                // Enhanced styling for completion
+                const statusClass = isComplete ? 'bg-green-100 border-green-600 opacity-80' : 'bg-white border-indigo-400 hover:shadow-xl';
+                const textClass = isComplete ? 'text-gray-500 line-through' : 'text-gray-800';
+                
+                const taskElement = document.createElement('div');
+                taskElement.id = `task-${task.id}`;
+                // IMPORTANT: Added 'relative' class to position the celebration SVG absolutely
+                taskElement.className = `relative flex items-center justify-between p-4 rounded-xl shadow-md border-l-4 transition duration-300 ${statusClass}`;
+
+                const completeButtonIcon = isComplete 
+                    ? `<svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd" /></svg>`
+                    : `<svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>`;
+
+                taskElement.innerHTML = `
+                    <div class="flex items-center flex-grow">
+                        <button ${toggleHandler} ${isDisabled ? 'disabled' : ''}
+                            class="p-2 mr-4 rounded-full ${isComplete ? 'bg-green-600 text-white shadow-lg' : 'border-2 border-indigo-500 text-indigo-600 hover:bg-indigo-100'} transition flex-shrink-0 ${isDisabled ? 'opacity-50 cursor-not-allowed' : ''}"
+                            title="${isComplete ? 'Mark Incomplete (Disabled when session is not active)' : 'Mark Complete'}">
+                            ${completeButtonIcon}
+                        </button>
+                        <p class="text-xl font-medium ${textClass}">${task.description}</p>
+                    </div>
+                    <div class="flex-shrink-0 ml-4">
+                        <button onclick="window.deleteTask('${task.id}')" class="text-gray-400 hover:text-red-500 transition p-2 rounded-full" title="Delete Task">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                            </svg>
+                        </button>
+                    </div>
+                `;
+
+                taskList.appendChild(taskElement);
+            });
+        }
+
+
+        // --- Initialization and Event Handling ---
+
+        function initializeApp() {
+            // 1. Load initial state
+            masterSessionState = loadSessionState();
+            const tasks = loadTasks();
+
+            // 2. Render initial UI
+            renderMasterSessionDisplay();
+            renderTasks(tasks);
+
+            // 3. If session was active, restart the timer locally
+            if (masterSessionState.isActive && masterSessionState.masterTargetTimestamp > Date.now()) {
+                startMasterTimer();
+            } else if (masterSessionState.isActive && masterSessionState.masterTargetTimestamp <= Date.now() && !masterSessionState.isAlarming) {
+                // If the app loads and the timer should have expired, immediately trigger the alarming state
+                const newState = { ...masterSessionState, isAlarming: true };
+                saveSessionState(newState);
+            }
+        }
+
+        taskForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const descriptionInput = document.getElementById('task-description');
+            const description = descriptionInput.value.trim();
+
+            if (!description) {
+                console.warn('Cannot add empty task.');
+                return;
+            }
+
+            // Task is added regardless of session state
+            addTask(description);
+            descriptionInput.value = ''; // Clear input field
+        });
+
+
+        // Expose functions globally for dynamic HTML event handlers
+        window.startSession = startSession;
+        window.stopSession = stopSession;
+        window.dismissMasterAlarm = dismissMasterAlarm;
+        window.toggleTaskComplete = toggleTaskComplete;
+        window.deleteTask = deleteTask;
+        window.adjustTime = adjustTime; // Inactive state adjustment
+        window.adjustActiveTime = adjustActiveTime; // Active state adjustment
+
+        initializeApp();
+    </script>
+</body>
+</html>
